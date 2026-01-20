@@ -103,6 +103,16 @@ static CAN_FRAME	AZE0_393_message	= {.ID = 0x393, .dlc = 8, .ide = 0, .rtr = 0, 
 
 static uint8_t	crctable[256] = {0,133,143,10,155,30,20,145,179,54,60,185,40,173,167,34,227,102,108,233,120,253,247,114,80,213,223,90,203,78,68,193,67,198,204,73,216,93,87,210,240,117,127,250,107,238,228,97,160,37,47,170,59,190,180,49,19,150,156,25,136,13,7,130,134,3,9,140,29,152,146,23,53,176,186,63,174,43,33,164,101,224,234,111,254,123,113,244,214,83,89,220,77,200,194,71,197,64,74,207,94,219,209,84,118,243,249,124,237,104,98,231,38,163,169,44,189,56,50,183,149,16,26,159,14,139,129,4,137,12,6,131,18,151,157,24,58,191,181,48,161,36,46,171,106,239,229,96,241,116,126,251,217,92,86,211,66,199,205,72,202,79,69,192,81,212,222,91,121,252,246,115,226,103,109,232,41,172,166,35,178,55,61,184,154,31,21,144,1,132,142,11,15,138,128,5,148,17,27,158,188,57,51,182,39,162,168,45,236,105,99,230,119,242,248,125,95,218,208,85,196,65,75,206,76,201,195,70,215,82,88,221,255,122,112,245,100,225,235,110,175,42,32,165,52,177,187,62,28,153,147,22,135,2,8,141};
 
+/* battery saver variables */	
+volatile static uint8_t fan_speed = 0;
+volatile static uint8_t last_fan_speed = 0;
+volatile static uint8_t tics_since_last_fan_change = 0;
+volatile static uint8_t fan_changes_in_a_row = 0;
+volatile static uint8_t saver_setting_active = 0;
+volatile static uint8_t soc_stop_charging = 100;
+	
+static uint8_t soc_stop_charging_values[8]  = { 66, 70, 75, 80, 85, 90, 95, 100 };
+
 void convert_array_to_5bc(Leaf_2011_5BC_message * dest, uint8_t * src);
 void calc_crc8(CAN_FRAME *frame);
 void reset_state(void);
@@ -283,21 +293,31 @@ void can_handler(uint8_t can_bus, CAN_FRAME *frame)
 				}
 								
 			}
+						
+			//Calculate the SOC% value to send to the dash (Battery sends 10-95% which needs to be rescaled to dash 0-100%)
+			dash_soc = (int16_t)(LB_MIN_SOC + (LB_MAX_SOC - LB_MIN_SOC) * (1.0 * battery_soc_pptt - MINPERCENTAGE) / (MAXPERCENTAGE - MINPERCENTAGE)); 
+			if (dash_soc < 0)
+			{ //avoid underflow
+					dash_soc = 0;
+			}
+			if (dash_soc > 1000)
+			{ //avoid overflow
+					dash_soc = 1000;
+			}
+			dash_soc = (dash_soc/10);
 
 			if( My_Leaf == MY_LEAF_2014 ) 
 			{
-				//Calculate the SOC% value to send to the dash (Battery sends 10-95% which needs to be rescaled to dash 0-100%)
-				dash_soc = (int16_t)(LB_MIN_SOC + (LB_MAX_SOC - LB_MIN_SOC) * (1.0 * battery_soc_pptt - MINPERCENTAGE) / (MAXPERCENTAGE - MINPERCENTAGE)); 
-				if (dash_soc < 0)
-				{ //avoid underflow
-						dash_soc = 0;
+				// If this is not written, soc% on dash will say "---"
+				// we also use it to display the active saver setting
+				if ( saver_setting_active )
+				{
+					frame->data[4] = soc_stop_charging;  
 				}
-				if (dash_soc > 1000)
-				{ //avoid overflow
-						dash_soc = 1000;
+				else
+				{
+					frame->data[4] = (uint8_t) dash_soc;  
 				}
-				dash_soc = (dash_soc/10);
-				frame->data[4] = (uint8_t) dash_soc;  //If this is not written, soc% on dash will say "---"
 			}
 
 			if(max_charge_80_requested)
@@ -308,8 +328,15 @@ void can_handler(uint8_t can_bus, CAN_FRAME *frame)
 					frame->data[3] = (frame->data[3] & 0xEF) | 0x10; //full charge completed
 				}
 			}
+			
+				if( (soc_stop_charging < 100) && (dash_soc >= soc_stop_charging) )
+				{
+					frame->data[1] = (frame->data[1] & 0xE0) | 2; //request charging stop
+				}
+			
             calc_crc8(frame);
             break;
+
 				case 0x50A: //Message from VCM
 					if(frame->dlc == 6)
 					{	//On ZE0 this message is 6 bytes long
@@ -416,6 +443,42 @@ void can_handler(uint8_t can_bus, CAN_FRAME *frame)
             }
 
             break;
+				
+				case 0x54B:
+					fan_speed = ((frame->data[4] & 0xF8) >> 3); // is 0-7
+				  if ( last_fan_speed != fan_speed )
+					{
+						last_fan_speed = fan_speed;
+						if ( tics_since_last_fan_change < 20 )
+						{
+							fan_changes_in_a_row++;
+						}
+						else
+						{
+							fan_changes_in_a_row = 0;
+						}
+						tics_since_last_fan_change = 0;
+						if ( fan_changes_in_a_row > 25 )
+						{
+							saver_setting_active = 1;
+						}
+						if ( saver_setting_active )
+						{
+							soc_stop_charging = soc_stop_charging_values[ fan_speed ];
+						}
+					}
+					if ( tics_since_last_fan_change < 100 )
+					{
+						++tics_since_last_fan_change;
+					}
+					
+					// turn the settng mode of as soon as recirc is on
+					if ( (frame->data[3] == 0x09) && saver_setting_active )
+					{
+						saver_setting_active = 0;
+					}
+					
+				break;
 
         case 0x55B:
 
